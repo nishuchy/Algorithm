@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Countdown Timer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin-top: 50px;
+        }
+        #timer {
+            font-size: 48px;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }
+        button {
+            font-size: 18px;
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Countdown Timer</h1>
+    <div id="timer">05:00</div>
+    <button onclick="startTimer()">Start</button>
+ 
+
+    <script>
+        let timer;
+        let totalSeconds = 300; // 5 minutes
+        let running = false;
+
+        function updateDisplay() {
+            let minutes = Math.floor(totalSeconds / 60);
+            let seconds = totalSeconds % 60;
+            document.getElementById('timer').textContent = 
+                (minutes < 10 ? '0' : '') + minutes + ":" + 
+                (seconds < 10 ? '0' : '') + seconds;
+        }
+
+        function startTimer() {
+            if (!running) {
+                running = true;
+                timer = setInterval(() => {
+                    if (totalSeconds > 0) {
+                        totalSeconds--;
+                        updateDisplay();
+                    } else {
+                        clearInterval(timer);
+                        running = false;
+                        alert("Time's up!");
+                    }
+                }, 1000);
+            }
+        }
+
+      
+        // Initialize display
+        updateDisplay();
+    </script>
+
+</body>
+</html>
