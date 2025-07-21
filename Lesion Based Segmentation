@@ -1,0 +1,192 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from pathlib import Path
+
+# --- Config ---
+IMAGE_SIZE = (256, 256)
+BATCH_SIZE = 8
+AUTOTUNE = tf.data.AUTOTUNE
+IMAGE_DIR = '/content/drive/MyDrive/DRdataset/DR_annotation_Batch_7/images'
+MASK_DIR = '/content/drive/MyDrive/DRdataset/DR_annotation_Batch_7/extracted_masks'
+
+# --- Data Loading ---
+def preprocess_image_mask(img_path, mask_path):
+    img = cv2.imread(img_path)
+    img = cv2.cvtColor(cv2.resize(img, IMAGE_SIZE), cv2.COLOR_BGR2RGB) / 255.0
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    mask = cv2.resize(mask, IMAGE_SIZE)
+    mask = (mask > 10).astype(np.float32)
+    return img, np.expand_dims(mask, axis=-1)
+
+VALID_EXTENSIONS = {'.jpg', '.jpeg', '.JPG', '.JPEG', '.png', '.tif', '.tiff', '.TIF', '.TIFF'}
+
+def get_base_name(filename):
+    base = Path(filename).stem
+    if '_' in base:
+        base = base.split('_')[0]
+    return base.lower()
+
+image_files, mask_files = [], []
+mask_dict = {}
+
+for root, _, files in os.walk(MASK_DIR):
+    for fname in files:
+        ext = Path(fname).suffix
+        if ext in VALID_EXTENSIONS:
+            base = get_base_name(fname)
+            mask_dict[base] = os.path.join(root, fname)
+
+for root, _, files in os.walk(IMAGE_DIR):
+    for fname in files:
+        ext = Path(fname).suffix
+        if ext in VALID_EXTENSIONS:
+            base = get_base_name(fname)
+            if base in mask_dict:
+                image_files.append(os.path.join(root, fname))
+                mask_files.append(mask_dict[base])
+
+print(f"Total image-mask pairs found: {len(image_files)}")
+
+train_imgs, val_imgs, train_masks, val_masks = train_test_split(
+    image_files, mask_files, test_size=0.2, random_state=42
+)
+
+# --- TF Dataset ---
+def parse_fn(img_path, mask_path):
+    img_path, mask_path = img_path.decode(), mask_path.decode()
+    img, mask = preprocess_image_mask(img_path, mask_path)
+    return img.astype(np.float32), mask.astype(np.float32)
+
+def tf_parse(img_path, mask_path):
+    img, mask = tf.numpy_function(parse_fn, [img_path, mask_path], [tf.float32, tf.float32])
+    img.set_shape([*IMAGE_SIZE, 3])
+    mask.set_shape([*IMAGE_SIZE, 1])
+    return img, mask
+
+def augment(img, mask):
+    if tf.random.uniform(()) > 0.5:
+        img, mask = tf.image.flip_left_right(img), tf.image.flip_left_right(mask)
+    if tf.random.uniform(()) > 0.5:
+        img, mask = tf.image.flip_up_down(img), tf.image.flip_up_down(mask)
+    if tf.random.uniform(()) > 0.5:
+        img, mask = tf.image.rot90(img), tf.image.rot90(mask)
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.random_brightness(img, max_delta=0.2)
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.random_contrast(img, 0.8, 1.2)
+    if tf.random.uniform(()) > 0.5:
+        img = tf.image.random_saturation(img, 0.8, 1.2)
+    return img, mask
+
+
+def get_dataset(img_paths, mask_paths, augment_data=False):
+    ds = tf.data.Dataset.from_tensor_slices((img_paths, mask_paths))
+    ds = ds.map(tf_parse, num_parallel_calls=AUTOTUNE)
+    if augment_data:
+        ds = ds.map(augment, num_parallel_calls=AUTOTUNE)
+    return ds.batch(BATCH_SIZE).prefetch(AUTOTUNE)
+
+train_ds = get_dataset(train_imgs, train_masks, augment_data=True)
+val_ds = get_dataset(val_imgs, val_masks, augment_data=False)
+
+# --- Custom Layer for Resizing ---
+class ResizeToMatch(tf.keras.layers.Layer):
+    def call(self, inputs):
+        source, reference = inputs  # source = feature to resize, reference = target for spatial size
+        target_shape = tf.shape(reference)[1:3]
+        return tf.image.resize(source, target_shape, method='bilinear')
+
+
+# --- Dice Loss ---
+def dice_loss(y_true, y_pred):
+    smooth = 1.
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return 1 - ((2. * intersection + smooth) /
+                (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth))
+
+# --- DeepLabV3+ Model with DenseNet201 ---
+def DeeplabV3Plus_DenseNet(input_shape=(256, 256, 3), num_classes=1):
+    base_model = tf.keras.applications.DenseNet201(include_top=False, weights='imagenet', input_shape=input_shape)
+
+    high_level_feature = base_model.get_layer('conv5_block32_concat').output
+    low_level_feature = base_model.get_layer('conv2_block6_concat').output
+
+    # ASPP
+    b0 = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(high_level_feature)
+    b0 = tf.keras.layers.BatchNormalization()(b0)
+    b0 = tf.keras.layers.ReLU()(b0)
+
+    b1 = tf.keras.layers.DepthwiseConv2D(3, dilation_rate=6, padding="same", use_bias=False)(high_level_feature)
+    b1 = tf.keras.layers.BatchNormalization()(b1)
+    b1 = tf.keras.layers.ReLU()(b1)
+
+    b2 = tf.keras.layers.DepthwiseConv2D(3, dilation_rate=12, padding="same", use_bias=False)(high_level_feature)
+    b2 = tf.keras.layers.BatchNormalization()(b2)
+    b2 = tf.keras.layers.ReLU()(b2)
+
+    b3 = tf.keras.layers.DepthwiseConv2D(3, dilation_rate=18, padding="same", use_bias=False)(high_level_feature)
+    b3 = tf.keras.layers.BatchNormalization()(b3)
+    b3 = tf.keras.layers.ReLU()(b3)
+
+    b4 = tf.keras.layers.GlobalAveragePooling2D()(high_level_feature)
+    b4 = tf.keras.layers.Reshape((1, 1, high_level_feature.shape[-1]))(b4)
+    b4 = tf.keras.layers.Conv2D(256, 1, padding="same", use_bias=False)(b4)
+    b4 = tf.keras.layers.BatchNormalization()(b4)
+    b4 = tf.keras.layers.ReLU()(b4)
+    b4 = tf.keras.layers.Resizing(
+        height=high_level_feature.shape[1],
+        width=high_level_feature.shape[2],
+        interpolation='bilinear'
+    )(b4)
+
+    # Concatenate ASPP
+    x = tf.keras.layers.Concatenate()([b0, b1, b2, b3, b4])
+    x = tf.keras.layers.Conv2D(256, 1, padding='same', use_bias=False)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.ReLU()(x)
+
+    # Resize x to match low-level feature
+    x = ResizeToMatch()([x, low_level_feature])
+
+    # Low-level feature projection
+    low_proj = tf.keras.layers.Conv2D(48, 1, padding="same", use_bias=False)(low_level_feature)
+    low_proj = tf.keras.layers.BatchNormalization()(low_proj)
+    low_proj = tf.keras.layers.ReLU()(low_proj)
+
+    x = tf.keras.layers.Concatenate()([x, low_proj])
+    x = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.Conv2D(256, 3, padding='same', activation='relu')(x)
+
+    x = tf.keras.layers.Resizing(input_shape[0], input_shape[1], interpolation='bilinear')(x)
+    output = tf.keras.layers.Conv2D(num_classes, 1, padding="same", activation='sigmoid')(x)
+
+    return tf.keras.Model(inputs=base_model.input, outputs=output)
+
+# --- Compile and Train ---
+model = DeeplabV3Plus_DenseNet()
+model.compile(
+    optimizer='adam',
+    loss='binary_crossentropy',
+    metrics=[
+        'accuracy',
+        tf.keras.metrics.AUC(name='AUC'),
+        tf.keras.metrics.Precision(name='Precision'),
+        tf.keras.metrics.Recall(name='Recall')
+    ]
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=50,
+    callbacks=[
+        tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+        tf.keras.callbacks.ModelCheckpoint('deeplabv3plus_best.h5', save_best_only=True, monitor='val_AUC', mode='max')
+    ]
+)
