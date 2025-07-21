@@ -1,0 +1,118 @@
+import os
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow.keras.applications import DenseNet201
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam, AdamW
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Set parameters
+batch_size = 32
+epochs = 30
+img_height, img_width = 224, 224
+num_classes = 10  # Update as per your dataset
+learning_rate = 0.001
+
+# Data augmentation and data generators
+train_datagen = ImageDataGenerator(
+    rescale=1.0/255.0,
+    rotation_range=30,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    vertical_flip=True,
+    fill_mode='nearest'
+)
+
+val_datagen = ImageDataGenerator(rescale=1.0/255.0)
+test_datagen = ImageDataGenerator(rescale=1.0/255.0)
+
+train_data = train_datagen.flow_from_directory(
+    data_dir,
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    class_mode='categorical'
+)
+
+val_data = val_datagen.flow_from_directory(
+    data_dir_val,
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    class_mode='categorical'
+)
+
+test_data = test_datagen.flow_from_directory(
+    data_dir_test,
+    target_size=(img_height, img_width),
+    batch_size=batch_size,
+    class_mode='categorical',
+    shuffle=False
+)
+
+# Load the pre-trained DenseNet201 model (excluding the top layer)
+base_model = DenseNet201(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+
+# Unfreeze the top layers of DenseNet201 for fine-tuning
+for layer in base_model.layers[-150:]:
+    layer.trainable = True
+
+# Add custom layers on top of the base model
+x = base_model.output
+x = GlobalAveragePooling2D()(x)        # Global average pooling to reduce dimensionality
+x = BatchNormalization()(x)            # Normalize after pooling
+x = Dropout(0.5)(x)                    # Dropout to reduce overfitting
+
+x = Dense(1024, activation='relu')(x)  # Fully connected layer with ReLU activation
+x = BatchNormalization()(x)
+x = Dropout(0.4)(x)
+
+x = Dense(512, activation='relu')(x)   # Another dense layer to learn complex patterns
+x = BatchNormalization()(x)
+x = Dropout(0.3)(x)
+
+# Output layer for 10 classes with softmax activation
+output = Dense(num_classes, activation='softmax')(x)
+
+# Combine base model and custom layers
+model = Model(inputs=base_model.input, outputs=output)
+
+# Compile the model
+
+
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+              loss='categorical_crossentropy',
+              metrics=['accuracy', 'AUC', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()])
+
+# Callbacks for early stopping and learning rate reduction
+early_stopping = EarlyStopping(monitor='val_accuracy', patience=10, restore_best_weights=True, verbose=1)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1)
+checkpoint = ModelCheckpoint('best_model.h5', monitor='val_accuracy', save_best_only=True, verbose=1)
+
+# Train the model
+history = model.fit(
+    train_data,
+    epochs=epochs,
+    validation_data=val_data,
+    callbacks=[early_stopping, reduce_lr, checkpoint]
+)
+# Define alpha using your class_weights from earlier:
+alpha = [0.5539, 0.3272, 1.5311, 0.8455, 3.9664, 295.5, 0.9009, 5.7379, 5.7941, 0.6287]
+early_stopping = EarlyStopping(monitor='val_accuracy', patience=10, restore_best_weights=True, verbose=1)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1)
+checkpoint = ModelCheckpoint('best_model.h5', monitor='val_accuracy', save_best_only=True, verbose=1)
+model.compile(
+    optimizer='adam',
+    loss=focal_loss(gamma=2.0, alpha=alpha),
+   metrics=['accuracy', 'AUC', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+)
+# Save the model
+model_save_path = '/content/drive/MyDrive/DRdataset/modelsforallclasses/densenet201_model_improved.h5'
+model.save(model_save_path)
+print(f"Model saved at: {model_save_path}")
